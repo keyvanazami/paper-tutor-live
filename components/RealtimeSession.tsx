@@ -81,6 +81,9 @@ export function RealtimeSession({ lessonId, onToolCall }: Props) {
   const speechEndMonitorRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const responseHadAudioRef = useRef(false);
   const captionScrollRef = useRef<HTMLDivElement | null>(null);
+  // Updated each animation frame from modelAnalyser; read in worklet.port.onmessage
+  // to gate mic forwarding against model playback (poor-man's AEC for Meet round-trip echo).
+  const lastModelRmsRef = useRef(0);
 
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -99,6 +102,9 @@ export function RealtimeSession({ lessonId, onToolCall }: Props) {
   const SILENCE_DETECT_MS = 500;
   const SILENCE_RMS_THRESHOLD = 0.005;
   const AUTO_ADVANCE_MS = 8000;
+  // Full-duplex echo gate: only forward mic frames to Gemini if mic is louder than
+  // model playback by this factor. Browser AEC can't see Meet's round-trip echo loop.
+  const ECHO_GATE_FACTOR = 1.5;
 
   useEffect(() => () => stop(), []);
 
@@ -295,6 +301,17 @@ export function RealtimeSession({ lessonId, onToolCall }: Props) {
         if (mutedRef.current) return;
         const session = sessionRef.current;
         if (!session) return;
+        const modelRms = lastModelRmsRef.current;
+        if (modelRms > SILENCE_RMS_THRESHOLD) {
+          const samples = new Int16Array(e.data);
+          let sumSq = 0;
+          for (let i = 0; i < samples.length; i++) {
+            const x = samples[i] / 32768;
+            sumSq += x * x;
+          }
+          const micRms = Math.sqrt(sumSq / samples.length);
+          if (micRms < modelRms * ECHO_GATE_FACTOR) return;
+        }
         session.sendRealtimeInput({
           audio: { data: abToBase64(e.data), mimeType: "audio/pcm;rate=16000" },
         });
@@ -333,6 +350,7 @@ export function RealtimeSession({ lessonId, onToolCall }: Props) {
       let modelSumSq = 0;
       for (let i = 0; i < modelBuf.length; i++) { const x = (modelBuf[i] - 128) / 128; modelSumSq += x * x; }
       const modelRms = Math.sqrt(modelSumSq / modelBuf.length);
+      lastModelRmsRef.current = modelRms;
       if (modelRms > SILENCE_RMS_THRESHOLD) modelLastActiveRef.current = Date.now();
 
       rafRef.current = requestAnimationFrame(tick);
@@ -426,7 +444,10 @@ export function RealtimeSession({ lessonId, onToolCall }: Props) {
         // Mime is "audio/pcm;rate=24000" — extract sample rate when present.
         const rateMatch = mime.match(/rate=(\d+)/);
         const rate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
-        if (!speaking) setSpeaking(true);
+        if (!speaking) {
+          setSpeaking(true);
+          if (halfDuplexRef.current) setMicEnabled(false);
+        }
         responseHadAudioRef.current = true;
         playPcmFrame(part.inlineData.data, rate);
       }
